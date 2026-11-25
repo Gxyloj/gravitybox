@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_fork_release:
+        description: 'Build and publish the existing 1.2.1.1 tag on Gxyloj/gravitybox'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: package-windows-${{ github.ref }}
@@ -21,7 +26,7 @@ permissions:
 jobs:
   package:
     name: Verify & Package Windows x64 Artifacts
-    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'Gxyloj/gravitybox' }}
+    if: ${{ github.repository == 'Gxyloj/gravitybox' || (github.event_name == 'workflow_dispatch' && !inputs.publish_fork_release) }}
     runs-on: windows-latest
     timeout-minutes: 35
     defaults:
@@ -30,6 +35,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.publish_fork_release && 'refs/tags/1.2.1.1' || github.ref }}
 
       - name: Setup Node.js 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -68,7 +75,7 @@ jobs:
 
       - name: Ensure NSIS compiler is available
         env:
-          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.include_installer }}
+          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.publish_fork_release || inputs.include_installer }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:INCLUDE_INSTALLER -ne 'true') {
@@ -88,7 +95,7 @@ jobs:
 
       - name: Build self-contained Windows packages
         env:
-          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.include_installer }}
+          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.publish_fork_release || inputs.include_installer }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:INCLUDE_INSTALLER -eq 'true') {
@@ -99,7 +106,7 @@ jobs:
 
       - name: Write SHA-256 summary for human verification
         env:
-          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.include_installer }}
+          INCLUDE_INSTALLER: ${{ github.event_name == 'push' || inputs.publish_fork_release || inputs.include_installer }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
@@ -117,7 +124,7 @@ jobs:
           $lines = @(
             "## GravityBox v$ver Windows x64 Packaging Artifacts",
             "",
-            "Manual runs only upload artifacts. The fork release tag also publishes these artifacts.",
+            "Artifacts are published only for the fork release tag or an explicit fork release dispatch.",
             "",
             '```text'
           )
@@ -140,7 +147,7 @@ jobs:
 
   publish-fork-release:
     name: Publish 1.2.1.1 to the fork
-    if: ${{ github.repository == 'Gxyloj/gravitybox' && github.event_name == 'push' && github.ref == 'refs/tags/1.2.1.1' }}
+    if: ${{ github.repository == 'Gxyloj/gravitybox' && ((github.event_name == 'push' && github.ref == 'refs/tags/1.2.1.1') || (github.event_name == 'workflow_dispatch' && inputs.publish_fork_release)) }}
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -149,6 +156,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORK_RELEASE_TAG: '1.2.1.1'
     steps:
       - name: Download and verify release artifacts
         shell: bash
@@ -178,10 +186,10 @@ jobs:
             release-assets/GravityBox-1.2.1.1-win-x64-setup.exe
             release-assets/GravityBox-1.2.1.1-win-x64-setup.exe.sha256
           )
-          draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          draft=$(gh release view "$FORK_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)
           case "$draft" in
             false) exit 0 ;;
-            true) gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber ;;
-            *) gh release create "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "GravityBox 1.2.1.1 (Windows WSL)" --notes-file release-notes.md ;;
+            true) gh release upload "$FORK_RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber ;;
+            *) gh release create "$FORK_RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "GravityBox 1.2.1.1 (Windows WSL)" --notes-file release-notes.md ;;
           esac
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest=true
+          gh release edit "$FORK_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=true
