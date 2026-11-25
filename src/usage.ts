@@ -32,6 +32,7 @@ import {
   type AvailableAccountUsageOption,
   type AvailableEnvironmentUsageOption,
   type DailyTokenUsage,
+  type EnvironmentKind,
   type EnvironmentShareBreakdown,
   type FileCacheEntry,
   type GenerationEvent,
@@ -830,7 +831,7 @@ export class UsageStatsManager {
         hostLabel?: string;
         host_label?: string;
         label?: string;
-        kind?: 'local' | 'ssh';
+        kind?: EnvironmentKind;
         online?: boolean;
         lastSyncedAt?: number;
         last_synced_at?: number;
@@ -843,7 +844,7 @@ export class UsageStatsManager {
         if (!item) continue;
         const id = String((item as KnownEnvironmentContext).id ?? (item as { environmentId?: string }).environmentId ?? '').trim();
         if (!id) continue;
-        const kind: 'local' | 'ssh' = item.kind === 'local' || id === 'local' ? 'local' : 'ssh';
+        const kind: EnvironmentKind = item.kind === 'local' || id === 'local' ? 'local' : item.kind === 'wsl' ? 'wsl' : 'ssh';
         const hostLabel = String(
           item.host_label ?? (item as { hostLabel?: string }).hostLabel ?? item.label ?? id
         ).trim();

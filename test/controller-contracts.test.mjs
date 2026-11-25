@@ -111,6 +111,9 @@ function encodeWsTextFrame(text) {
 
 function createMockCdpBrowserServer(pageUrl, dictVersion) {
   const receivedMethods = [];
+  const bootExpressions = [];
+  const hudAttachments = [];
+  const quotaOrigins = [];
   const sockets = new Set();
   const bootedPages = new Set();
   const server = createHttpServer((req, res) => {
@@ -188,7 +191,18 @@ function createMockCdpBrowserServer(pageUrl, dictVersion) {
               const expr = String(msg.params?.expression || '');
               if (expr.includes('globalThis.__GRAVITYBOX_BOOT__=')) {
                 bootedPages.add(targetUrl);
+                bootExpressions.push(expr.split('\n', 1)[0]);
                 result = { result: { type: 'undefined' } };
+              } else if (expr.includes('__GRAVITYBOX_ATTACH_HUD__?.()')) {
+                hudAttachments.push(pageUrl);
+                result = { result: { type: 'undefined' } };
+              } else if (expr.includes("invoke('GetUserStatus'")) {
+                const origin = new URL(pageUrl).origin;
+                assert.ok(expr.includes(`location.origin === ${JSON.stringify(origin)}`));
+                quotaOrigins.push(origin);
+                result = { result: { type: 'object', value: {
+                  ok: true, data: { userStatusData: { userStatus: { email: 'wsl@example.invalid' } }, quotaSummaryData: {} },
+                } } };
               } else if (expr.includes('document.querySelector')) {
                 result = { result: { type: 'boolean', value: true } };
               } else if (expr === 'globalThis.__GRAVITYBOX_ENGINE_V1__?.state()') {
@@ -209,12 +223,91 @@ function createMockCdpBrowserServer(pageUrl, dictVersion) {
   return {
     server,
     receivedMethods,
+    bootExpressions,
+    hudAttachments,
+    quotaOrigins,
+    navigate(nextUrl) {
+      pageUrl = nextUrl;
+      bootedPages.clear();
+    },
     async close() {
       for (const s of sockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
     },
   };
 }
+
+test('WSL 窗口经复验后启用保守汉化和 HUD，并拒绝导航到身份不明的端口', async t => {
+  const profile = await mkdtemp(join(tmpdir(), 'gb-wsl-window-'));
+  t.after(() => rm(profile, { recursive: true, force: true }));
+  const dictionary = dictionaryFromEntries({ Settings: '设置' });
+  const initial = 'https://127.0.0.1:44001/';
+  const replacement = 'https://127.0.0.1:44002/';
+  const foreign = 'https://127.0.0.1:44003/';
+  const mock = createMockCdpBrowserServer(initial, dictionary.version);
+  await new Promise(resolve => mock.server.listen(0, '127.0.0.1', resolve));
+  const port = mock.server.address().port;
+  const verifiedUrls = [];
+  const controller = new Controller({
+    appPath: join(profile, 'Antigravity.app'),
+    profile,
+    dictionary,
+    discoverEndpoint: async () => ({
+      port, pid: 4400, browserURL: `ws://127.0.0.1:${port}/devtools/browser/mock`,
+      appVersion: '2.35.1', legacyPatch: false,
+    }),
+    inspectPage: async url => {
+      verifiedUrls.push(url);
+      return url === foreign ? 'foreign' : { kind: 'wsl', distribution: 'Ubuntu', uid: '1000' };
+    },
+    onStatus: () => {},
+  });
+  try {
+    await controller.start();
+    assert.equal(controller.status.mode, 'adaptive');
+    assert.equal(controller.status.windows, 1);
+    assert.ok(verifiedUrls.filter(url => url === initial).length >= 2);
+    assert.match(mock.bootExpressions.at(-1), /"conservative":true/);
+    assert.ok(mock.hudAttachments.includes(initial));
+    assert.equal(mock.receivedMethods.includes('Page.addScriptToEvaluateOnNewDocument'), false);
+    const hudTarget = controller.hudBridge.targets.get('page-1');
+    assert.equal(hudTarget.sourceKind, 'remote');
+    assert.equal(hudTarget.rpcClient, controller.pages.get('page-1').rpcClient);
+    assert.equal(controller.status.sshWindowsCount, 0);
+    const [usageTarget] = controller.getUsageRpcTargets();
+    assert.equal(usageTarget.environmentKind, 'wsl');
+    assert.equal(usageTarget.hostLabel, 'WSL Ubuntu');
+    assert.match(usageTarget.environmentId, /^wsl:[0-9a-f]+$/);
+    assert.equal(usageTarget.origin, new URL(initial).origin);
+    assert.equal(controller.getConnectedRemoteRpcTargets().length, 0);
+    const [quota, repeat] = await Promise.all([controller.probeWslQuota(), controller.probeWslQuota()]);
+    assert.equal(quota?.email, 'wsl@example.invalid');
+    assert.equal(repeat, quota);
+    assert.deepEqual(mock.quotaOrigins, [new URL(initial).origin]);
+
+    mock.navigate(replacement);
+    await controller.sync();
+    assert.equal(controller.status.windows, 1);
+    assert.ok(verifiedUrls.includes(replacement));
+    assert.ok(mock.hudAttachments.includes(replacement));
+    assert.equal(controller.getUsageRpcTargets()[0].environmentId, usageTarget.environmentId);
+    assert.equal(controller.getUsageRpcTargets()[0].origin, new URL(replacement).origin);
+    assert.equal((await controller.probeWslQuota())?.email, 'wsl@example.invalid');
+    assert.deepEqual(mock.quotaOrigins, [new URL(initial).origin, new URL(replacement).origin]);
+
+    const bootCount = mock.bootExpressions.length;
+    mock.navigate(foreign);
+    await controller.sync();
+    assert.equal(controller.status.windows, 0);
+    assert.ok(verifiedUrls.includes(foreign));
+    assert.equal(mock.bootExpressions.length, bootCount);
+    assert.equal(await controller.probeWslQuota(), undefined);
+    assert.deepEqual(controller.getUsageRpcTargets(), []);
+  } finally {
+    await controller.stop();
+    await mock.close();
+  }
+});
 
 describeContractGroup("连接与控制 · debug-port-missing", { concurrency: false }, async () => {
   test('isApplicationRunning 拒绝对 Insiders 与无效路径返回 true', async () => {

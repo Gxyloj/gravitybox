@@ -69,7 +69,7 @@ export interface SyncReceipt {
   committed_at: number;
 }
 
-export type EnvironmentKind = 'local' | 'ssh';
+export type EnvironmentKind = 'local' | 'ssh' | 'wsl';
 export type EnvironmentLifecycleState =
   | 'online'
   | 'auth_expired'
@@ -104,7 +104,7 @@ export interface EnvironmentNode {
 
 export interface AvailableEnvironmentUsageOption {
   id: string;
-  kind: 'all' | 'local' | 'ssh';
+  kind: 'all' | EnvironmentKind;
   label: string;
   host_label?: string;
   total_tokens?: number;
@@ -118,7 +118,7 @@ export interface AvailableEnvironmentUsageOption {
 
 export interface KnownEnvironmentContext {
   id: string;
-  kind: 'local' | 'ssh';
+  kind: EnvironmentKind;
   host_label?: string;
   label?: string;
   online?: boolean;
@@ -207,7 +207,7 @@ export interface GenerationEvent {
   generation_index?: number;
   legacy_event_key?: string;
   account_confidence?: 'observed' | 'inferred' | 'unknown' | 'legacy';
-  environment_kind?: 'local' | 'ssh';
+  environment_kind?: EnvironmentKind;
   environment_id?: string;
   environment_label?: string;
   trajectory_id?: string;
@@ -231,15 +231,16 @@ export interface GenerationEvent {
  */
 export function normalizeEventEnvironment(
   ev?: Pick<GenerationEvent, 'environment_kind' | 'environment_id' | 'environment_label'> | null
-): { kind: 'local' | 'ssh'; id: string; label: string } {
-  if (ev?.environment_kind === 'ssh') {
+): { kind: EnvironmentKind; id: string; label: string } {
+  const kind = ev?.environment_kind;
+  if (ev && (kind === 'ssh' || kind === 'wsl')) {
     const rawId = typeof ev.environment_id === 'string' ? ev.environment_id.trim() : '';
     const rawLabel = typeof ev.environment_label === 'string' ? ev.environment_label.trim() : '';
-    const id = rawId || (rawLabel ? `ssh:${rawLabel}` : 'ssh');
+    const id = rawId || (rawLabel ? `${kind}:${rawLabel}` : kind);
     return {
-      kind: 'ssh',
+      kind,
       id,
-      label: rawLabel || rawId || 'ssh',
+      label: rawLabel || rawId || kind,
     };
   }
   return {

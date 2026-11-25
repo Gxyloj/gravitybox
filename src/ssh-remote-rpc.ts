@@ -967,17 +967,24 @@ export function computeRemoteConversationHudMetrics(
 }
 
 /**
- * 通过 CDP Isolated World 执行与 SSH 渲染页同源的 Connect JSON RPC 只读查询。
+ * 通过 CDP Isolated World 执行与 SSH 或 WSL 渲染页同源的 Connect JSON RPC 只读查询。
  * 所有凭证均在页面隔离世界内读取与消耗，绝不传出 Node 侧或落盘。
  */
 export class SshRemoteRpcClient implements RemoteRpcClientLike {
   private readonly cdp: Pick<CDP, 'evaluate'>;
   private readonly getContextId: () => number | undefined;
+  private readonly getVerifiedOrigin?: () => string | undefined;
   private readonly timeoutMs: number;
 
-  constructor(options: { cdp: Pick<CDP, 'evaluate'>; getContextId: () => number | undefined; timeoutMs?: number }) {
+  constructor(options: {
+    cdp: Pick<CDP, 'evaluate'>;
+    getContextId: () => number | undefined;
+    getVerifiedOrigin?: () => string | undefined;
+    timeoutMs?: number;
+  }) {
     this.cdp = options.cdp;
     this.getContextId = options.getContextId;
+    this.getVerifiedOrigin = options.getVerifiedOrigin;
     this.timeoutMs = options.timeoutMs ?? 2500;
   }
 
@@ -1002,6 +1009,7 @@ export class SshRemoteRpcClient implements RemoteRpcClientLike {
               'x-codeium-csrf-token': token,
             },
             body: JSON.stringify(payload ?? {}),
+            redirect: 'error',
             signal: controller ? controller.signal : undefined,
           });
           if (res.status === 401 || res.status === 403) {
@@ -1026,11 +1034,15 @@ export class SshRemoteRpcClient implements RemoteRpcClientLike {
 
   private async evaluateInWorld<T>(expression: string): Promise<RemoteRpcCallResult<T>> {
     const contextId = this.getContextId();
-    if (contextId === undefined) {
+    const origin = this.getVerifiedOrigin?.();
+    if (contextId === undefined || (this.getVerifiedOrigin && !origin)) {
       return { ok: false, reason: 'context_unavailable', authExpired: false };
     }
     try {
-      const result = await this.cdp.evaluate(expression, contextId) as RemoteRpcCallResult<T> | null | undefined;
+      const guardedExpression = origin
+        ? `(() => location.origin === ${JSON.stringify(origin)} ? ${expression} : { ok: false, reason: 'context_unavailable', authExpired: false })()`
+        : expression;
+      const result = await this.cdp.evaluate(guardedExpression, contextId) as RemoteRpcCallResult<T> | null | undefined;
       if (!result || typeof result !== 'object') {
         return { ok: false, reason: 'rpc_error', authExpired: false };
       }

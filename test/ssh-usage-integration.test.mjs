@@ -118,6 +118,92 @@ function createWiredCoordinator({ stateDir, usageManager, getTargets, resolveMat
   });
 }
 
+test('WSL 同源增量用量写入独立环境，换端口重读不会重复入账', async t => {
+  const { geminiDir, stateDir } = await createIsolatedWorkspace(t, 'gb-wsl-usage-');
+  const usageManager = new UsageStatsManager({ geminiDir, stateDir });
+  const environmentId = 'wsl:fixture';
+  const hostLabel = 'WSL Ubuntu';
+  const date = new Date(Date.now() - 60_000).toISOString();
+  const trajectoryId = 'wsl-usage-trajectory';
+  const rpcTarget = makeRemoteRpcTarget({ remoteKey: 'first-window', hostLabel, trajectories: [{
+    cascadeId: 'wsl-cascade', trajectoryId, stepCount: 1, lastModifiedTime: date,
+    generators: [{ stepIndices: [0], executionId: 'wsl-generation', model: 'gemini-2.5-pro', usage: { inputTokens: '500', outputTokens: '200' } }],
+    steps: [{ idx: 0, type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE', status: 'CORTEX_STEP_STATUS_DONE',
+      metadata: { createdAt: date, executionId: 'wsl-generation' } }],
+  }] });
+  let target = { ...rpcTarget, environmentId, environmentKind: 'wsl' };
+  const coordinator = createWiredCoordinator({ stateDir, usageManager, getTargets: () => [target] });
+  usageManager.setOnlineRemoteEnvironments([{ id: environmentId, kind: 'wsl', host_label: hostLabel }]);
+  assert.equal((await coordinator.syncNow()).eventsSaved, 1);
+  assert.equal((await coordinator.syncNow()).eventsSaved, 0);
+  assert.ok((await usageManager.getSyncReceipts())[buildRemoteTrajectorySourceId(trajectoryId, environmentId)]);
+  assert.notEqual(buildRemoteTrajectorySourceId(trajectoryId, environmentId), buildRemoteTrajectorySourceId(trajectoryId));
+
+  target = { ...target, remoteKey: 'replacement-window', origin: 'https://127.0.0.1:44902' };
+  await coordinator.syncNow({ force: true });
+  await coordinator.observationStore.flush();
+  const all = await usageManager.getUsageSummary(false);
+  assert.equal(all.all_time.totals.total_tokens, 700);
+  assert.equal(all.all_time.totals.request_count, 1);
+  assert.equal(all.available_environments.find(env => env.id === environmentId)?.kind, 'wsl');
+  const scoped = await usageManager.getUsageSummary(false, 'all', environmentId);
+  assert.equal(scoped.all_time.totals.total_tokens, 700);
+  const local = await usageManager.getUsageSummary(false, 'all', 'local');
+  assert.equal(local.all_time.totals.total_tokens, 0);
+  const rows = await usageManager.getUsageEvents('all', '', 0, 10, undefined, false, false, 'all', environmentId);
+  assert.equal(rows.total, 1);
+  assert.equal(rows.rows[0].environment_kind, 'wsl');
+
+  usageManager.setOnlineRemoteEnvironments([]);
+  const offline = await usageManager.getUsageSummary(false);
+  assert.equal(offline.available_environments.find(env => env.id === environmentId)?.online, false);
+  assert.deepEqual(offline.environment_breakdown.offline_ssh_hosts, []);
+});
+
+test('WSL 历史文件补齐实时索引，已入账的会话保留同一身份且坏文件不阻塞同步', async t => {
+  const { geminiDir, stateDir } = await createIsolatedWorkspace(t, 'gb-wsl-history-');
+  const usageManager = new UsageStatsManager({ geminiDir, stateDir });
+  const environmentId = 'wsl:history';
+  const makeTrajectory = (id, offsetMs) => {
+    const date = new Date(Date.now() - offsetMs).toISOString();
+    return {
+      cascadeId: id, trajectoryId: id + '-trajectory', stepCount: 1, lastModifiedTime: date,
+      generators: [{ stepIndices: [0], executionId: id + '-generation', model: 'gemini-2.5-pro', usage: { inputTokens: '500', outputTokens: '200' } }],
+      steps: [{ idx: 0, type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE', status: 'CORTEX_STEP_STATUS_DONE',
+        metadata: { createdAt: date, executionId: id + '-generation' } }],
+    };
+  };
+  const trajectories = [makeTrajectory('live', 60_000), makeTrajectory('archived', 86_400_000)];
+  const remote = makeRemoteRpcTarget({ remoteKey: 'wsl-window', hostLabel: 'WSL Ubuntu', trajectories });
+  const attempts = [];
+  const indexed = new Set(['live']);
+  const target = { ...remote, environmentId, environmentKind: 'wsl', rpcClient: {
+    ...remote.rpcClient,
+    async getAllCascadeTrajectories() {
+      const res = await remote.rpcClient.getAllCascadeTrajectories();
+      return { ok: true, data: res.data.filter(summary => indexed.has(summary.cascadeId)) };
+    },
+    async getExecutorMetadata(id) {
+      attempts.push(id);
+      if (id === 'inaccessible') return { ok: false, reason: 'http_error' };
+      indexed.add(id);
+      return { ok: true, data: null };
+    },
+  } };
+  const coordinator = createWiredCoordinator({ stateDir, usageManager, getTargets: () => [target] });
+  assert.equal((await coordinator.syncNow()).eventsSaved, 1);
+
+  target.wslArchive = { listCascadeIds: async () => ['archived', 'live', 'inaccessible'], lastAttemptedAt: new Map() };
+  assert.equal((await coordinator.syncNow()).eventsSaved, 1);
+  assert.equal((await coordinator.syncNow()).eventsSaved, 0);
+  assert.deepEqual(attempts, ['archived', 'inaccessible']);
+
+  await coordinator.syncNow({ force: true });
+  const result = await usageManager.getUsageSummary(false, 'all', environmentId);
+  assert.equal(result.all_time.totals.request_count, 2);
+  assert.equal(result.all_time.totals.total_tokens, 1400);
+});
+
 test('M2-E2E-1: 本地账号A + 远端SSH账号B混账并账、默认加总占比、离线主机提示与IPC投影', async t => {
   const { geminiDir, stateDir } = await createIsolatedWorkspace(t, 'gb-m2-e2e-1-');
   const nowSec = Math.floor(Date.now() / 1000) - 60;

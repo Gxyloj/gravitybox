@@ -1248,3 +1248,12 @@ test('Stage 2 Windows 后端修复回归: 凭据容量裁剪、IPC 缺助手阻�
     assert.ok(commandsRsText.includes(`"${host}"`), `commands.rs ALLOWED_EXTERNAL_HOSTS 缺少 ${host}`);
   }
 });
+
+test('Windows 发布版本支持四段版本，保留底层 SemVer 并校验安装程序版本范围', async () => {
+  const { resolveWindowsReleaseVersion, resolveWindowsPackagePaths } = await import('../tools/package-win.mjs');
+  assert.equal(resolveWindowsReleaseVersion({ version: '1.2.1' }), '1.2.1');
+  const version = resolveWindowsReleaseVersion({ version: '1.2.1', windowsReleaseVersion: '1.2.1.1' });
+  assert.match(resolveWindowsPackagePaths({ version, arch: 'x64' }).zipPath, /GravityBox-1\.2\.1\.1-win-x64\.zip$/);
+  assert.throws(() => resolveWindowsReleaseVersion({ version: '1.2.1', windowsReleaseVersion: '1.2.2.1' }));
+  assert.throws(() => resolveWindowsReleaseVersion({ version: '1.2.1', windowsReleaseVersion: '1.2.1.65536' }));
+});

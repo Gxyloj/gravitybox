@@ -251,6 +251,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
         ]);
         const activeAcc = listRes.active_account;
         const liveAccountEmail = liveLs?.email ?? null;
+        const wslQuota = liveLs?.quotaEnvironmentId === 'wsl' ? liveLs.quota : null;
         let sourceAcc: any = activeAcc;
         let currentAccountId: string | null = listRes.active_account_id;
         let activeEmail = activeAcc?.email ?? '';
@@ -269,13 +270,13 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           if (matchedSaved) {
             savedQuotaForFusion = matchedSaved.quota ?? null;
             liveQuotaForFusion = liveLs?.quota ?? null;
-            const mergedQuota = mergeLiveQuotaWithSaved(matchedSaved.quota, liveLs?.quota, dashboardNowMs);
+            const mergedQuota = wslQuota ?? mergeLiveQuotaWithSaved(matchedSaved.quota, liveLs?.quota, dashboardNowMs);
             sourceAcc = { ...matchedSaved, ...(mergedQuota ? { quota: mergedQuota } : {}) };
             currentAccountId = matchedSaved.id;
             activeEmail = matchedSaved.email;
             activeName = matchedSaved.name || liveLs?.name || '';
             isLiveVerified = true;
-            quotaRefreshError = cleanAndLocalizeRefreshError(matchedSaved.quota_refresh_error) ?? '';
+            quotaRefreshError = wslQuota ? '' : cleanAndLocalizeRefreshError(matchedSaved.quota_refresh_error) ?? '';
           } else {
             // 实机运行账号未保存在本地账号库：严禁混入已存 activeAcc 的姓名、等级或配额
             savedQuotaForFusion = null;
@@ -293,7 +294,9 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           }
         }
 
-        const fusedDashboardQuota = activeEmail
+        const fusedDashboardQuota = wslQuota
+          ? { quota: wslQuota, quotaSourceEnvironmentId: 'wsl', activeRemoteEnvIds: [] }
+          : activeEmail
           ? fuseAccountQuotaAcrossEnvironments({
               email: activeEmail,
               savedQuota: savedQuotaForFusion,
@@ -846,12 +849,12 @@ async function run() {
     reloadDictionary: async () => { await store.reload(); await applyChain; if (store.lastError) throw new Error(store.lastError); },
     onStatus,
   });
-  let lastConnectedRemoteEnvs = new Map<string, { hostLabel: string; state: string; email: string }>();
+  let lastConnectedRemoteEnvs = new Map<string, { origin: string; state: string; email: string }>();
   const lastRemoteHeartbeatAtMs = new Map<string, number>();
   const remoteLastSyncedAtSec = new Map<string, number>();
   const remoteSyncCoordinator = new RemoteUsageSyncCoordinator({
     stateDir,
-    getTargets: () => controller.getConnectedRemoteRpcTargets(),
+    getTargets: () => controller.getUsageRpcTargets(),
     ledger: {
       receipts: () => usageManager.getSyncReceipts(),
       save: async (
@@ -940,7 +943,7 @@ async function run() {
       });
     }
     for (const obsEnv of remoteSyncCoordinator.observationStore.listEnvironments()) {
-      if (!obsEnv.environmentId || obsEnv.environmentId === 'local') continue;
+      if (!obsEnv.environmentId || obsEnv.environmentId === 'local' || obsEnv.environmentId.startsWith('wsl:')) continue;
       if (obsEnv.lastSyncedAt && obsEnv.lastSyncedAt > 0) {
         const prev = remoteLastSyncedAtSec.get(obsEnv.environmentId) ?? 0;
         if (obsEnv.lastSyncedAt > prev) remoteLastSyncedAtSec.set(obsEnv.environmentId, obsEnv.lastSyncedAt);
@@ -954,7 +957,7 @@ async function run() {
       }
     }
     for (const [envId, syncedSec] of remoteLastSyncedAtSec.entries()) {
-      if (envId === 'local' || histMap.has(envId)) continue;
+      if (envId === 'local' || envId.startsWith('wsl:') || histMap.has(envId)) continue;
       histMap.set(envId, {
         environmentId: envId,
         hostLabel: envId,
@@ -989,11 +992,11 @@ async function run() {
   };
   syncRemoteTargetStateAndMaybeTriggerSync = () => {
     if (stopping) return;
-    const targets = controller.getConnectedRemoteRpcTargets();
+    const targets = controller.getUsageRpcTargets();
     const sessions = controller.getRemoteSessionsSnapshot();
     const windowCounts = controller.getEnvironmentWindowCounts();
     const envMap = new Map<string, KnownEnvironmentContext>();
-    const currentConnected = new Map<string, { hostLabel: string; state: string; email: string }>();
+    const currentConnected = new Map<string, { origin: string; state: string; email: string }>();
     let shouldTriggerSync = false;
 
     for (const t of targets) {
@@ -1002,7 +1005,7 @@ async function run() {
       const lifecycleState: EnvironmentLifecycleState = t.state === 'auth_expired' ? 'auth_expired' : 'online';
       envMap.set(t.environmentId, {
         id: t.environmentId,
-        kind: 'ssh',
+        kind: t.environmentKind ?? 'ssh',
         host_label: t.hostLabel,
         label: t.hostLabel,
         online,
@@ -1011,11 +1014,11 @@ async function run() {
         ...(lastSynced !== undefined ? { last_synced_at: lastSynced } : {}),
       });
       if (online) {
-        currentConnected.set(t.environmentId, { hostLabel: t.hostLabel, state: t.state, email: t.email });
+        currentConnected.set(t.environmentId, { origin: t.origin, state: t.state, email: t.email });
         const prev = lastConnectedRemoteEnvs.get(t.environmentId);
         const nowMs = Date.now();
         const heartbeatDue = nowMs - (lastRemoteHeartbeatAtMs.get(t.environmentId) ?? 0) >= 30_000;
-        if (!prev || prev.state !== t.state || prev.email !== t.email) {
+        if (!prev || prev.origin !== t.origin || prev.state !== t.state || prev.email !== t.email) {
           shouldTriggerSync = true;
         }
         if (t.email && (!prev || prev.state !== t.state || prev.email !== t.email || heartbeatDue)) {
@@ -1070,7 +1073,7 @@ async function run() {
   const runBoundedRemoteSyncForDemand = async (maxWaitMs = 6_000): Promise<void> => {
     syncRemoteTargetStateAndMaybeTriggerSync();
     if (stopping || fixture) return;
-    if (controller.getConnectedRemoteRpcTargets().length === 0) return;
+    if (controller.getUsageRpcTargets().length === 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const syncAc = new AbortController();
     try {
@@ -1183,13 +1186,21 @@ async function run() {
   store.on('invalid', message => controller.dictionaryError(String(message)));
   store.on('valid', () => controller.dictionaryError());
   let commandChain = Promise.resolve(); const ipcMetrics = { statusRequests: 0, taskPayloadReplies: 0 };
+  async function probeDesktopQuotaForDisplay() {
+    const wsl = await controller.probeWslQuota();
+    if (wsl !== undefined) return { live: wsl, isWsl: true };
+    return { live: await probeLiveCached().catch(() => null), isWsl: false };
+  }
   const startQuotaRefreshTask = () => tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, progress, _commit) => {
     const remoteProbePromise = controller.getRemoteSessionsSnapshot().some(s => s.state !== 'disconnected')
       ? buildRemoteSessionsPayload({ force: true }).catch(() => [] as Record<string, unknown>[])
       : Promise.resolve([] as Record<string, unknown>[]);
+    const wsl = await controller.probeWslQuota(true);
+    const wslRefreshed = wsl?.quota.models?.length ? 1 : 0;
     const [result] = await Promise.all([
       accountsManager.refreshAllQuotas(globalThis.fetch, {
         signal,
+        excludeEmail: wslRefreshed ? wsl?.email : undefined,
         onAccountUpdated: (account, done, total) => {
           if (account?.quota?.models?.length) {
             registerObservedModelsFromSource(account.quota.models);
@@ -1212,7 +1223,7 @@ async function run() {
     const extraRemoteUpdated = remoteRefreshedIds.size;
     const rawSkippedStandby = (result as { skippedStandby?: number }).skippedStandby ?? 0;
     const skippedStandby = Math.max(0, rawSkippedStandby - extraRemoteUpdated);
-    const updatedCount = result.accounts.length + extraRemoteUpdated;
+    const updatedCount = result.accounts.length + extraRemoteUpdated + wslRefreshed;
     const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
     const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
     const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
@@ -1305,12 +1316,20 @@ async function run() {
           const remoteCandidatesForStatus = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(statusNowMs));
           if (parsed.includeAccounts !== false) {
             try {
-              const liveLs = await probeLiveCached().catch(() => null);
+              const { live: liveLs, isWsl } = await probeDesktopQuotaForDisplay();
               const listRes = await accountsManager.listAccounts({ liveEmailHint: liveLs?.email ?? null });
               accountsRevision = listRes.revision;
               usageManager.setKnownAccounts(listRes.accounts.map(a => ({ id: a.id, email: a.email, name: a.name ?? null })));
-              const detectedEmail = liveLs?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
-              if (detectedEmail) {
+              const detectedEmail = isWsl ? null : liveLs?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
+              if (isWsl) {
+                cachedLocalAccountSnapshot = null;
+                if (liveLs) {
+                  const quota = accountsManager.getAccountQuotaOverview({ quota: liveLs.quota }, { nowMs: statusNowMs });
+                  liveAccountEmail = activeAccountEmail = liveLs.email;
+                  activeFiveHourQuota = quota.fiveHourRemaining;
+                  activeSubscriptionTier = resolveUnsavedLiveSubscriptionTier(liveLs, quota);
+                }
+              } else if (detectedEmail) {
                 liveAccountEmail = liveLs?.email ?? null;
                 const matchedSummary = listRes.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
                 if (liveLs?.email) {
@@ -1429,7 +1448,7 @@ async function run() {
         const targetEnvironmentId = typeof parsed.environmentId === 'string' && parsed.environmentId.trim() ? parsed.environmentId.trim() : undefined;
         const counts = store.layerCounts;
         const dictTotal = (counts?.builtin ?? 0) + (counts?.incremental ?? 0) + (counts?.personal ?? 0);
-        const livePromise = probeLiveCached().catch(() => null);
+        const desktopProbe = probeDesktopQuotaForDisplay();
         const pricingSyncPromise = Promise.all([
           syncActiveOfficialModelsToUsageManager(),
           syncActiveAccountToUsageManager().catch(() => {}),
@@ -1438,11 +1457,15 @@ async function run() {
           controller.coverageReport(),
           buildDashboardAggregate({
             listAccounts: async () => {
-              const liveForDashboard = await livePromise;
-              return accountsManager.listAccounts({ liveEmailHint: liveForDashboard?.email ?? null });
+              const { live, isWsl } = await desktopProbe;
+              const list = await accountsManager.listAccounts({ liveEmailHint: live?.email ?? null });
+              return isWsl && !live ? { ...list, active_account_id: null, active_account: null } : list;
             },
             getAutoSwitchConfig: () => accountsManager.getAutoSwitchConfig(),
-            probeLiveLanguageServer: () => livePromise,
+            probeLiveLanguageServer: async () => {
+              const { live, isWsl } = await desktopProbe;
+              return isWsl && live ? { ...live, quotaEnvironmentId: 'wsl' } : live;
+            },
             getAccount: (id: string) => accountsManager.getAccount(id),
             getAccountQuotaOverview: (account: any, options?: any) => accountsManager.getAccountQuotaOverview(account, options),
             getUsageSummary: () => {
@@ -1515,10 +1538,10 @@ async function run() {
           if (command === 'account_list') {
             const index = await accountsManager.loadIndex();
             const listNowMs = Date.now();
-            const live = await probeLiveCached().catch(() => null);
-            const detectedEmail = live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
+            const { live, isWsl } = await probeDesktopQuotaForDisplay();
+            const detectedEmail = isWsl ? live?.email : live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
             const remoteCandidates = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(listNowMs));
-            let effectiveActiveId = index.current_account_id;
+            let effectiveActiveId = isWsl ? null : index.current_account_id;
             if (detectedEmail) {
               const matched = index.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
               effectiveActiveId = matched?.id ?? null;
@@ -1533,19 +1556,22 @@ async function run() {
                 quota: null, quota_refresh_error: bt('main.account_missing'),
                 credentialReadiness: { state: 'needs_authorization', message: bt('main.account_check_files') } };
               const isLiveMatched = live?.email?.toLowerCase() === summary.email.toLowerCase() && live.quota;
-              if (isLiveMatched) {
+              if (isLiveMatched && !isWsl) {
                 scheduleExpiredQuotaCorrection(summary.id, live.quota, listNowMs);
               }
-              const fused = fuseAccountQuotaAcrossEnvironments({
-                email: saved.email,
-                savedQuota: saved.quota,
-                liveLocalQuota: isLiveMatched ? live.quota : null,
-                remoteSessions: remoteCandidates,
-                nowMs: listNowMs,
-              });
+              const fused = isWsl && isLiveMatched
+                ? { quota: live.quota, quotaSourceEnvironmentId: 'wsl', activeRemoteEnvIds: [] }
+                : fuseAccountQuotaAcrossEnvironments({
+                  email: saved.email,
+                  savedQuota: saved.quota,
+                  liveLocalQuota: isLiveMatched ? live.quota : null,
+                  remoteSessions: remoteCandidates,
+                  nowMs: listNowMs,
+                });
               const acc: Account = {
                 ...saved,
                 quota: fused.quota,
+                ...(isWsl && isLiveMatched ? { quota_refresh_error: null, quota_refresh_error_code: null } : {}),
               };
               const projected = projectAccountForIpcNormalized(acc, {
                 nowMs: listNowMs,
@@ -1755,10 +1781,26 @@ async function run() {
           if (command === 'quota_refresh') {
             const refreshNowMs = Date.now();
             const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
-            const identity = await resolveActiveIdentityForIpc();
             const index = await accountsManager.loadIndex().catch(() => null);
             const targetId = typeof parsed.id === 'string' && parsed.id ? parsed.id : (index?.current_account_id ?? null);
             const targetAcc = targetId ? await accountsManager.getAccount(targetId).catch(() => null) : null;
+            const wsl = targetAcc ? await controller.probeWslQuota() : null;
+            if (targetAcc && wsl?.email.toLowerCase() === targetAcc.email.toLowerCase()) {
+              const refreshed = await controller.probeWslQuota(true);
+              if (refreshed?.email.toLowerCase() === targetAcc.email.toLowerCase()) {
+                const account = projectAccountForIpcNormalized({
+                  ...targetAcc, quota: refreshed.quota, quota_refresh_error: null, quota_refresh_error_code: null,
+                }, {
+                  nowMs: refreshNowMs, isActive: true, hasLocalOAuthClient, includeOverviewFields: true,
+                  formatResetTime, revisionWithReadiness: true, quotaSourceEnvironmentId: 'wsl',
+                });
+                const partial = refreshed.quota.refresh_state?.complete === false;
+                reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
+                  quota: account?.quota ?? null, account, subscription_tier: normalizeSubscriptionTier(account?.subscription_tier) });
+                return;
+              }
+            }
+            const identity = await resolveActiveIdentityForIpc();
             const targetIsLocalActive = isIdentityActiveAccount(identity, targetAcc);
             const remoteRefreshReply = await refreshStandbyAccountViaRemoteSsh({
               targetAcc,

@@ -44,9 +44,10 @@ import {
   type WindowSourceKind,
 } from './ssh-context.js';
 import { SshRemoteRpcClient, type RemoteRpcClientLike } from './ssh-remote-rpc.js';
-import { buildRemoteEnvironmentId } from './remote-usage-sync.js';
+import { buildRemoteEnvironmentId, type WslUsageArchive } from './remote-usage-sync.js';
 import { mergeLiveQuotaWithSaved } from './ipc-projections.js';
 import type { LiveLanguageServerStatus, QuotaData } from './accounts.js';
+import { listWslConversationIds, type VerifiedWslPageService } from './platform/wsl.js';
 
 export type RemoteSessionConnectionState = 'connected' | 'disconnected' | 'auth_expired' | 'unverified';
 
@@ -79,6 +80,8 @@ export interface ConnectedRemoteRpcTarget {
   remoteKey: string;
   hostLabel: string;
   environmentId: string;
+  environmentKind?: 'wsl';
+  wslArchive?: WslUsageArchive;
   origin: string;
   rpcClient: RemoteRpcClientLike;
   email: string;
@@ -125,6 +128,10 @@ export type PageSession = {
   languageMode?: string;
   detaching?: boolean;
   sourceKind?: WindowSourceKind;
+  wsl?: VerifiedWslPageService;
+  wslArchive?: WslUsageArchive;
+  verifiedWslOrigin?: string;
+  wslQuotaProbe?: { expiresAt: number; result: Promise<LiveLanguageServerStatus | null> };
   remoteKey?: string;
   environmentId?: string;
   machineId?: string;
@@ -143,6 +150,11 @@ function isSafeCandidate(key: unknown): key is string {
   return typeof key === 'string' && isEnglishSource(key) && key.length <= 400 && !/(?:https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?:^|\s)(?:\/|~\/|[A-Za-z]:\\)|\b(?:sk-|AIza)[A-Za-z0-9_-]{12,})/.test(key);
 }
 const WORLD = 'GRAVITYBOX-localization-v1';
+
+function wslEnvironmentId(service: VerifiedWslPageService): string {
+  const identity = JSON.stringify([service.distribution.toLowerCase(), service.uid]);
+  return `wsl:${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
+}
 
 export class Controller {
   private endpoint?: Endpoint;
@@ -303,7 +315,27 @@ export class Controller {
     if (this.options.verifyPage) {
       return (await this.options.verifyPage(url, appPath)) ? 'local' : 'unlisted';
     }
-    return inspectPageService(url, appPath);
+    const endpoint = this.endpoint;
+    return inspectPageService(url, appPath, endpoint && {
+      pid: endpoint.pid,
+      profile: endpoint.profile ?? this.options.profile,
+      appVersion: endpoint.appVersion,
+    });
+  }
+  private async verifyWslFrame(session: PageSession, url: string): Promise<void> {
+    if (!session.wsl) return;
+    const service = await this.inspectPageState(url, this.activeAppPath());
+    if (typeof service !== 'object') {
+      throw new Error(this.t('controller.err.page_unverified'));
+    }
+    const origin = new URL(url).origin;
+    if (session.verifiedWslOrigin !== origin || wslEnvironmentId(session.wsl) !== wslEnvironmentId(service)) {
+      session.wsl = service;
+      session.wslArchive = undefined;
+      session.verifiedWslOrigin = origin;
+      session.wslQuotaProbe = undefined;
+      this.hudBridge.updateTargetOrigin(session.targetId, origin);
+    }
   }
   private async verifyRemoteWindowTarget(params: {
     appVersion: string;
@@ -442,6 +474,7 @@ export class Controller {
   }
   private verifiedBundle(session?: PageSession){
     if(this.options.fixture)return true;
+    if(session?.wsl)return false;
     if(session&&session.verifiedBundle!==undefined)return session.verifiedBundle;
     return isSupportedBundleHash(this.status.appVersion,this.status.bundleSha256);
   }
@@ -528,6 +561,12 @@ export class Controller {
                 nextOrigin = new URL(target.url).origin;
               } catch {}
               session.url = target.url;
+              if (session.wsl && prevOrigin !== nextOrigin) {
+                this.hudBridge.detachTargetPanes(id);
+                session.contextId = undefined;
+                session.verifiedWslOrigin = undefined;
+                session.wslQuotaProbe = undefined;
+              }
               if (session.sourceKind === 'remote' && prevOrigin !== nextOrigin) {
                 session.bundleSha256 = undefined;
                 session.verifiedBundle = undefined;
@@ -562,6 +601,7 @@ export class Controller {
         try {
           const browserContextId = browserContextByTargetId.get(target.id);
           let sourceKind: WindowSourceKind = 'local';
+          let wsl: VerifiedWslPageService | undefined;
           let remoteKey: string | undefined;
           let hostLabel: string | undefined;
           let machineId: string | undefined;
@@ -570,9 +610,9 @@ export class Controller {
             sourceKind = 'local';
           } else {
             const serviceKind = await this.inspectPageState(target.url, activeApp);
-            if (serviceKind === 'local') {
-              sourceKind = 'local';
-              if (browserContextId) this.localBrowserContextIds.add(browserContextId);
+            if (serviceKind === 'local' || typeof serviceKind === 'object') {
+              if (typeof serviceKind === 'object') wsl = serviceKind;
+              if (!wsl && browserContextId) this.localBrowserContextIds.add(browserContextId);
             } else if (serviceKind === 'foreign') {
               this.status.errors.push(this.t('controller.err.window_unverified'));
               continue;
@@ -633,6 +673,7 @@ export class Controller {
             url: target.url,
             updateChain: Promise.resolve(),
             sourceKind,
+            wsl,
             remoteKey,
             environmentId,
             machineId,
@@ -640,23 +681,26 @@ export class Controller {
             browserContextId,
             lastFocusedAt: Date.now(),
           };
-          if (sourceKind === 'remote') {
+          if (sourceKind === 'remote' || wsl) {
             session.rpcClient = new SshRemoteRpcClient({
               cdp,
               getContextId: () => session.contextId,
+              ...(wsl ? { getVerifiedOrigin: () => session.detaching ? undefined : session.verifiedWslOrigin } : {}),
             });
+          }
+          if (sourceKind === 'remote') {
             this.upsertConnectedRemoteSession(session);
           } else {
             this.localFocusedAt = Math.max(this.localFocusedAt, session.lastFocusedAt ?? 0);
           }
-          let targetOrigin = '';
-          try { targetOrigin = new URL(target.url).origin; } catch {}
           this.pages.set(target.id, session);
           cdp.on('disconnected', () => {this.hudBridge.detachTarget(target.id);if(!session.detaching&&this.pages.get(target.id)===session){this.pages.delete(target.id);this.markRemoteSessionDisconnected(session);this.scheduleSync();}});
           cdp.on('Page.frameNavigated', (event) => {
             if (!event.frame?.parentId) {
               this.hudBridge.detachTargetPanes(target.id);
               session.contextId = undefined;
+              session.verifiedWslOrigin = undefined;
+              session.wslQuotaProbe = undefined;
               if (session.sourceKind === 'remote' && event.frame?.url) {
                 try {
                   const nextOrigin = new URL(event.frame.url).origin;
@@ -673,20 +717,14 @@ export class Controller {
           cdp.on('Runtime.executionContextsCleared', () => {
             this.hudBridge.detachTargetPanes(target.id);
             session.contextId = undefined;
+            session.verifiedWslOrigin = undefined;
+            session.wslQuotaProbe = undefined;
             if (!session.detaching && !this.stopped) this.scheduleSync(300);
           });
           await cdp.send('Page.enable'); await cdp.send('Runtime.enable');
           await cdp.send('Runtime.addBinding',{name:'__gravityboxLanguageChanged',executionContextName:WORLD});
           await cdp.send('Runtime.addBinding',{name:'__gravityboxWindowFocus',executionContextName:WORLD});
-          if (!this.observeOnly) {
-            await this.hudBridge.attachToTarget(target.id, cdp, () => session.contextId, WORLD, {
-              sourceKind,
-              ...(remoteKey ? { remoteKey } : {}),
-              ...(hostLabel ? { hostLabel } : {}),
-              ...(targetOrigin ? { origin: targetOrigin } : {}),
-              ...(session.rpcClient ? { rpcClient: session.rpcClient } : {}),
-            });
-          }
+          if (!this.observeOnly) await this.ensureHudBridgeAttached(session);
           cdp.on('Runtime.bindingCalled',(event)=>{
             if(event.name==='__gravityboxLanguageChanged'&&event.executionContextId===session.contextId&&['zh','en'].includes(event.payload)){
               session.languageMode=event.payload;this.publish();if(this.hudEnabled){void this.hudBridge.refreshAllForLocaleChange();}
@@ -758,7 +796,7 @@ export class Controller {
           : this.t('status.waiting_supported_window');
       this.publish(defaultMode, defaultMsg);
 
-      const localSession = [...this.pages.values()].find(s => s.sourceKind !== 'remote');
+      const localSession = [...this.pages.values()].find(s => s.sourceKind !== 'remote' && !s.wsl);
       if (!this.options.fixture && !this.observeOnly && this.endpoint && localSession && !this.inspectingBundle && (this.lastInspectedAppVersion !== this.endpoint.appVersion || this.lastInspectedSha !== localSession.bundleSha256 || this.lastInspectedDictVersion !== this.options.dictionary.version)) {
         try {
           const origin = new URL(localSession.url).origin;
@@ -801,9 +839,10 @@ export class Controller {
       const tree = await session.cdp.send('Page.getFrameTree');
       const frame = tree.frameTree.frame;
       if (!allowedTarget({ type: 'page', url: frame.url }, this.options.fixture?.origin)) return;
+      await this.verifyWslFrame(session, frame.url);
       const isRemote = session.sourceKind === 'remote';
       if (this.observeOnly) {
-        if (!this.options.fixture && this.endpoint && !isRemote) {
+        if (!this.options.fixture && this.endpoint && !isRemote && !session.wsl) {
           const activeApp = this.activeAppPath();
           if (!await this.checkPageService(frame.url, activeApp)) throw new Error(this.t('controller.err.page_unverified'));
         }
@@ -816,7 +855,7 @@ export class Controller {
         session.languageMode = 'en';
         return;
       }
-      if(!this.options.fixture&&this.endpoint&&!isRemote){
+      if(!this.options.fixture&&this.endpoint&&!isRemote&&!session.wsl){
         const activeApp = this.activeAppPath();
         if(!await this.checkPageService(frame.url,activeApp))throw new Error(this.t('controller.err.page_unverified'));
         const bundle=await this.bundleCache.read(activeApp,this.endpoint.pid,this.endpoint.appVersion,new URL(frame.url).origin,undefined,'local');
@@ -907,7 +946,8 @@ export class Controller {
     return session.updateChain;
   }
   private async applyDocumentRegistration(session: PageSession): Promise<void> {
-    if(session.detaching||this.dormant||this.stopped)return;
+    // WSL documents are bootstrapped only after checking the current frame's live service.
+    if(session.wsl||session.detaching||this.dormant||this.stopped)return;
     if(session.registration){await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:session.registration});session.registration=undefined;}
     if(session.detaching||this.dormant||this.stopped)return;
     const registered=await session.cdp.send('Page.addScriptToEvaluateOnNewDocument',{source:this.boot(session.url,session),worldName:WORLD});
@@ -1171,6 +1211,32 @@ export class Controller {
     return this.remoteObservedVersion;
   }
 
+  /** undefined means no WSL window is attached. null means the live data is temporarily unavailable. */
+  public async probeWslQuota(force = false): Promise<LiveLanguageServerStatus | null | undefined> {
+    const session = [...this.pages.values()]
+      .filter(page => page.wsl && !page.detaching)
+      .sort((a, b) => (b.lastFocusedAt ?? 0) - (a.lastFocusedAt ?? 0))[0];
+    if (!session) return undefined;
+    if (session.contextId === undefined || !session.verifiedWslOrigin || !session.rpcClient) return null;
+
+    const cached = session.wslQuotaProbe;
+    if (cached && (cached.expiresAt === Infinity || (!force && cached.expiresAt > Date.now()))) return cached.result;
+
+    const request: NonNullable<PageSession['wslQuotaProbe']> = {
+      expiresAt: Infinity,
+      result: session.rpcClient.probeUserAndQuota().then(result => {
+        if (session.wslQuotaProbe !== request || session.detaching) return null;
+        request.expiresAt = Date.now() + (result.ok ? this.REMOTE_SESSION_CACHE_TTL_MS : 3_000);
+        return result.ok ? result.data : null;
+      }).catch(() => {
+        request.expiresAt = Date.now() + 3_000;
+        return null;
+      }),
+    };
+    session.wslQuotaProbe = request;
+    return request.result;
+  }
+
   public getActiveSshWindowsSummary(): { count: number; hosts: string[] } {
     const remotePages = [...this.pages.values()].filter(p => !p.detaching && p.sourceKind === 'remote');
     const hosts = [...new Set(remotePages.map(p => cleanHostLabel(p.hostLabel) || (p.hostLabel || '').trim()).filter(Boolean))];
@@ -1304,6 +1370,36 @@ export class Controller {
 
     targets.sort((a, b) => b.lastFocusedAt - a.lastFocusedAt);
     return targets.map(item => item.target);
+  }
+
+  public getUsageRpcTargets(): ConnectedRemoteRpcTarget[] {
+    const wslTargets = new Map<string, ConnectedRemoteRpcTarget>();
+    const pages = [...this.pages.values()].sort((a, b) => (b.lastFocusedAt ?? 0) - (a.lastFocusedAt ?? 0));
+    for (const page of pages) {
+      const { wsl, verifiedWslOrigin: origin, contextId } = page;
+      if (page.detaching || !wsl || !origin || contextId === undefined) continue;
+      const environmentId = wslEnvironmentId(wsl);
+      const existing = wslTargets.get(environmentId);
+      if (existing) {
+        existing.windowCount++;
+        continue;
+      }
+      const rpcClient = new SshRemoteRpcClient({
+        cdp: page.cdp,
+        getContextId: () => !page.detaching && page.contextId === contextId && page.verifiedWslOrigin === origin && page.wsl === wsl
+          ? contextId : undefined,
+        getVerifiedOrigin: () => origin,
+      });
+      page.wslArchive ??= { listCascadeIds: () => listWslConversationIds(wsl), lastAttemptedAt: new Map() };
+      wslTargets.set(environmentId, {
+        remoteKey: `${environmentId}:${page.targetId}`,
+        hostLabel: `WSL ${wsl.distribution}`,
+        environmentId, environmentKind: 'wsl', origin, rpcClient, wslArchive: page.wslArchive,
+        email: '', name: null, accountType: 'unknown', matchedLocalAccountId: null,
+        state: 'connected', windowCount: 1, lastIdentityVerifiedAt: 0, reconnected: false,
+      });
+    }
+    return [...this.getConnectedRemoteRpcTargets(), ...wslTargets.values()];
   }
 
   public applyObservedRemoteIdentity(params: {
@@ -1519,10 +1615,12 @@ export class Controller {
   private async ensureHudBridgeAttached(session: PageSession): Promise<void> {
     let targetOrigin = '';
     try { targetOrigin = new URL(session.url).origin; } catch {}
+    const remoteKey = session.wsl ? `wsl:${session.targetId}` : session.remoteKey;
+    const hostLabel = session.wsl ? 'WSL' : session.hostLabel;
     await this.hudBridge.attachToTarget(session.targetId, session.cdp, () => session.contextId, WORLD, {
-      sourceKind: session.sourceKind ?? 'local',
-      ...(session.remoteKey ? { remoteKey: session.remoteKey } : {}),
-      ...(session.hostLabel ? { hostLabel: session.hostLabel } : {}),
+      sourceKind: session.wsl ? 'remote' : session.sourceKind ?? 'local',
+      ...(remoteKey ? { remoteKey } : {}),
+      ...(hostLabel ? { hostLabel } : {}),
       ...(targetOrigin ? { origin: targetOrigin } : {}),
       ...(session.rpcClient ? { rpcClient: session.rpcClient } : {}),
     });
@@ -1578,6 +1676,7 @@ export class Controller {
           this.pages.delete(id);
           continue;
         }
+        await this.verifyWslFrame(session, frame.url);
         session.url = frame.url;
         await this.ensureHudBridgeAttached(session);
         await this.refreshRegistration(session);

@@ -2590,12 +2590,13 @@ export class AccountsManager {
    */
   async refreshAllQuotas(
     fetchImpl: typeof globalThis.fetch = globalThis.fetch,
-    options?: { signal?: AbortSignal; onAccountUpdated?: (account: Account, done: number, total: number) => void }
+    options?: { signal?: AbortSignal; excludeEmail?: string; onAccountUpdated?: (account: Account, done: number, total: number) => void }
   ): Promise<{ accounts: Account[]; failures: { id: string; message: string }[]; skippedStandby: number }> {
     options?.signal?.throwIfAborted();
     const index = await this.loadIndex();
     const activeId = index.current_account_id;
-    const enabledAccounts = index.accounts.filter(acc => !acc.disabled).sort((a, b) => {
+    const excludedEmail = options?.excludeEmail?.toLowerCase();
+    const enabledAccounts = index.accounts.filter(acc => !acc.disabled && acc.email.toLowerCase() !== excludedEmail).sort((a, b) => {
       const aActive = a.id === activeId ? 1 : 0;
       const bActive = b.id === activeId ? 1 : 0;
       return bActive - aActive;

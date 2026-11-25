@@ -52,7 +52,7 @@ export interface ConversationHudMetrics {
   metricsSequence?: number;
   /** 数据可信度与可用性状态 */
   availability?: HudDataAvailability;
-  /** 指标来源环境（缺省或 'local' 为本机，'remote' 为 SSH 远程主机） */
+  /** 指标读取方式（本机数据库或通过 SSH/WSL 页面执行的同源 RPC） */
   sourceKind?: 'local' | 'remote';
   /** 脱敏后的远程主机展示标签 */
   remoteHostLabel?: string;

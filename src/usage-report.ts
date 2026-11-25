@@ -14,6 +14,7 @@ import {
   resolveDatabaseModelFullName,
   type AvailableAccountUsageOption,
   type DailyTokenUsage,
+  type EnvironmentKind,
   type GenerationEvent,
   type HourlyTokenUsage,
   type KnownEnvironmentContext,
@@ -212,7 +213,7 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     ev: GenerationEvent,
     evCost: number | null,
     modelName: string,
-    envKind: 'local' | 'ssh'
+    envKind: EnvironmentKind
   ) => {
     bucket.totalIn += ev.input_tokens;
     bucket.totalOut += ev.output_tokens;
@@ -263,8 +264,8 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
   let unknownTimeTokens = 0;
 
   const envStats = new Map<string, EnvAggregateCounters>();
-  const allSshEnvsSeen = new Map<string, string>();
-  const recordEnvStat = (evEnv: { kind: 'local' | 'ssh'; id: string; label: string }, tokens: number, usd: number | null) => {
+  const nonLocalEnvironmentsSeen = new Map<string, string>();
+  const recordEnvStat = (evEnv: ReturnType<typeof normalizeEventEnvironment>, tokens: number, usd: number | null) => {
     const prev = envStats.get(evEnv.id) ?? {
       kind: evEnv.kind,
       hostLabel: evEnv.label,
@@ -313,11 +314,11 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
 
   for (const ev of allEvents) {
     const evEnv = normalizeEventEnvironment(ev);
-    if (evEnv.kind === 'ssh') {
+    if (evEnv.kind !== 'local') {
       const cleanedLabel = cleanHostLabel(evEnv.label) || evEnv.label;
-      const prevLabel = allSshEnvsSeen.get(evEnv.id);
+      const prevLabel = nonLocalEnvironmentsSeen.get(evEnv.id);
       if (!prevLabel || (prevLabel === evEnv.id && cleanedLabel !== evEnv.id)) {
-        allSshEnvsSeen.set(evEnv.id, cleanedLabel);
+        nonLocalEnvironmentsSeen.set(evEnv.id, cleanedLabel);
       }
     }
     const envHit = selectedEnvId === 'all' || evEnv.id === selectedEnvId;
@@ -364,11 +365,11 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
   // 单遍分桶聚合：同时产出全部周期、每日趋势、今日分时与未知时间统计，且每条事件只查一次价/锁费率
   for (const ev of orderedEvents) {
     const evEnv = normalizeEventEnvironment(ev);
-    if (evEnv.kind === 'ssh') {
+    if (evEnv.kind !== 'local') {
       const cleanedLabel = cleanHostLabel(evEnv.label) || evEnv.label;
-      const prevLabel = allSshEnvsSeen.get(evEnv.id);
+      const prevLabel = nonLocalEnvironmentsSeen.get(evEnv.id);
       if (!prevLabel || (prevLabel === evEnv.id && cleanedLabel !== evEnv.id)) {
-        allSshEnvsSeen.set(evEnv.id, cleanedLabel);
+        nonLocalEnvironmentsSeen.set(evEnv.id, cleanedLabel);
       }
     }
     const modelName = resolveDatabaseModelFullName(ev.model, null);
@@ -464,7 +465,7 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
 
   const { availableEnvironments, offlineSshHosts } = buildAvailableEnvironments(
     envStats,
-    allSshEnvsSeen,
+    nonLocalEnvironmentsSeen,
     environments,
     receiptSyncTimes
   );

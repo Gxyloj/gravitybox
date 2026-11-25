@@ -18,6 +18,7 @@ import {
   peVersion,
   portOwner,
 } from './platform/index.js';
+import { verifyWslPageService, type VerifiedWslPageService } from './platform/wsl.js';
 const execFileRaw = promisify(execFile);
 const execute = (file: string, args: string[], timeout = 3000) => execFileRaw(file, args, { timeout });
 export type Endpoint = { port: number; pid: number; browserURL: string; appVersion: string; legacyPatch: boolean; appPath?: string; profile?: string };
@@ -374,9 +375,13 @@ export function allowedTarget(target: { type: string; url: string }, fixtureOrig
 
 const verifiedPortCache = new Map<string, { valid: boolean; expiresAt: number }>();
 
-export type PageServiceKind = 'local' | 'unlisted' | 'foreign';
+export type PageServiceKind = 'local' | 'unlisted' | 'foreign' | VerifiedWslPageService;
 
-export async function inspectPageService(url: string, appPath: string): Promise<PageServiceKind> {
+export async function inspectPageService(
+  url: string,
+  appPath: string,
+  endpoint?: { pid: number; profile: string; appVersion: string },
+): Promise<PageServiceKind> {
   if (!allowedTarget({ type: 'page', url })) return 'foreign';
   const port = Number(new URL(url).port);
   const cacheKey = `${appPath}:${port}`;
@@ -390,7 +395,7 @@ export async function inspectPageService(url: string, appPath: string): Promise<
       const owners = await portOwner(port);
       if (owners.length === 0) {
         verifiedPortCache.delete(cacheKey);
-        return 'unlisted';
+        return (endpoint && await verifyWslPageService(port, endpoint)) ?? 'unlisted';
       }
       if (!owners.every((o) => isLoopbackAddress(o.localAddress))) {
         verifiedPortCache.delete(cacheKey);

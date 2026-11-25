@@ -7,6 +7,7 @@ import {
     resolveDatabaseModelFullName,
     type AvailableAccountUsageOption,
     type AvailableEnvironmentUsageOption,
+    type EnvironmentKind,
     type EnvironmentShareBreakdown,
     type KnownEnvironmentContext,
     type TokenUsagePeriod,
@@ -38,7 +39,7 @@ export function envDisplayLabel(
 }
 
 export interface EnvAggregateCounters {
-    kind: 'local' | 'ssh';
+    kind: EnvironmentKind;
     hostLabel: string;
     totalTokens: number;
     requestCount: number;
@@ -82,7 +83,7 @@ export function buildPeriodEnvironmentBreakdown(
 
 export function buildAvailableEnvironments(
     envStats: ReadonlyMap<string, EnvAggregateCounters>,
-    allSshEnvsSeen: ReadonlyMap<string, string>,
+    nonLocalEnvironmentsSeen: ReadonlyMap<string, string>,
     knownEnvironments?: readonly KnownEnvironmentContext[],
     receiptSyncTimes?: ReadonlyMap<string, number>
 ): { availableEnvironments: AvailableEnvironmentUsageOption[]; offlineSshHosts: string[] } {
@@ -95,9 +96,9 @@ export function buildAvailableEnvironments(
         }
     }
 
-    const sshEnvIds = new Set<string>(allSshEnvsSeen.keys());
+    const nonLocalEnvironmentIds = new Set<string>(nonLocalEnvironmentsSeen.keys());
     for (const [id, meta] of knownMap.entries()) {
-        if (meta.kind === 'ssh') sshEnvIds.add(id);
+        if (meta.kind !== 'local') nonLocalEnvironmentIds.add(id);
     }
 
     const localStat = envStats.get('local') ?? {
@@ -111,19 +112,20 @@ export function buildAvailableEnvironments(
     let allTokens = localStat.totalTokens;
     let allRequests = localStat.requestCount;
     let allUsd = localStat.estimatedUsd;
-    const sshOptions: AvailableEnvironmentUsageOption[] = [];
+    const nonLocalOptions: AvailableEnvironmentUsageOption[] = [];
     const offlineSshHosts: string[] = [];
     const offlineSet = new Set<string>();
 
-    for (const envId of sshEnvIds) {
+    for (const envId of nonLocalEnvironmentIds) {
         const st = envStats.get(envId);
         const known = knownMap.get(envId);
+        const kind = (st?.kind === 'wsl' || known?.kind === 'wsl' || envId.startsWith('wsl:')) ? 'wsl' : 'ssh';
         const online = known ? known.online !== false : false;
         const rawHostLabel =
             known?.host_label?.trim() ||
             known?.label?.trim() ||
             (st?.hostLabel && st.hostLabel !== envId ? st.hostLabel : '') ||
-            allSshEnvsSeen.get(envId) ||
+            nonLocalEnvironmentsSeen.get(envId) ||
             envId;
         const hostLabel = cleanHostLabel(rawHostLabel) || rawHostLabel;
         const lifecycleState = known?.lifecycle_state ?? (online ? 'online' : 'historical_only');
@@ -137,15 +139,15 @@ export function buildAvailableEnvironments(
         allRequests += requestCount;
         allUsd += st?.estimatedUsd ?? 0;
 
-        if (!online && !offlineSet.has(hostLabel)) {
+        if (kind === 'ssh' && !online && !offlineSet.has(hostLabel)) {
             offlineSet.add(hostLabel);
             offlineSshHosts.push(hostLabel);
         }
 
-        sshOptions.push({
+        nonLocalOptions.push({
             id: envId,
-            kind: 'ssh',
-            label: envDisplayLabel('usage.env.ssh', { host: hostLabel }),
+            kind,
+            label: kind === 'wsl' ? hostLabel : envDisplayLabel('usage.env.ssh', { host: hostLabel }),
             host_label: hostLabel,
             total_tokens: totalTokens,
             request_count: requestCount,
@@ -157,7 +159,7 @@ export function buildAvailableEnvironments(
         });
     }
 
-    sshOptions.sort((a, b) => {
+    nonLocalOptions.sort((a, b) => {
         const onlineDiff = (b.online ? 1 : 0) - (a.online ? 1 : 0);
         if (onlineDiff !== 0) return onlineDiff;
         return (a.host_label ?? a.label).localeCompare(b.host_label ?? b.label);
@@ -187,7 +189,7 @@ export function buildAvailableEnvironments(
     };
 
     const availableEnvironments: AvailableEnvironmentUsageOption[] =
-        sshOptions.length > 0 ? [allOption, localOption, ...sshOptions] : [allOption, localOption];
+        nonLocalOptions.length > 0 ? [allOption, localOption, ...nonLocalOptions] : [allOption, localOption];
 
     return { availableEnvironments, offlineSshHosts };
 }
@@ -442,7 +444,7 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
     const knownById = new Map(options.accounts.map(acc => [acc.id, acc]));
     const knownByEmail = new Map(options.accounts.map(acc => [acc.email.toLowerCase(), acc]));
     const envStats = new Map<string, EnvAggregateCounters>();
-    const allSshEnvsSeen = new Map<string, string>();
+    const nonLocalEnvironmentsSeen = new Map<string, string>();
     let minPositiveTs = Infinity;
     let changedRateMinSeq = Number.POSITIVE_INFINITY;
     let healedUnpricedCount = 0;
@@ -560,10 +562,10 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
                 continue;
 
             const evEnv = rowItem.evEnv;
-            if (evEnv.kind === 'ssh') {
-                const prevLabel = allSshEnvsSeen.get(evEnv.id);
+            if (evEnv.kind !== 'local') {
+                const prevLabel = nonLocalEnvironmentsSeen.get(evEnv.id);
                 if (!prevLabel || (prevLabel === evEnv.id && evEnv.label !== evEnv.id)) {
-                    allSshEnvsSeen.set(evEnv.id, evEnv.label);
+                    nonLocalEnvironmentsSeen.set(evEnv.id, evEnv.label);
                 }
             }
 
@@ -700,7 +702,7 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
 
     const { availableEnvironments, offlineSshHosts } = buildAvailableEnvironments(
         envStats,
-        allSshEnvsSeen,
+        nonLocalEnvironmentsSeen,
         options.environments,
         receiptSyncTimes
     );
@@ -888,9 +890,9 @@ export function ledgerEventPage(db: DatabaseSync, options: {
     if (effectiveEnvId === 'local') {
         conditions.push("COALESCE(json_extract(r.payload,'$.environment_kind'),'local')='local'");
     } else if (effectiveEnvId !== 'all') {
-        conditions.push("json_extract(r.payload,'$.environment_kind')='ssh'");
+        conditions.push("json_extract(r.payload,'$.environment_kind') IN ('ssh','wsl')");
         conditions.push(
-            "COALESCE(NULLIF(TRIM(json_extract(r.payload,'$.environment_id')),''), CASE WHEN NULLIF(TRIM(json_extract(r.payload,'$.environment_label')),'') IS NOT NULL THEN 'ssh:' || TRIM(json_extract(r.payload,'$.environment_label')) ELSE 'ssh' END)=?"
+            "COALESCE(NULLIF(TRIM(json_extract(r.payload,'$.environment_id')),''), CASE WHEN NULLIF(TRIM(json_extract(r.payload,'$.environment_label')),'') IS NOT NULL THEN json_extract(r.payload,'$.environment_kind') || ':' || TRIM(json_extract(r.payload,'$.environment_label')) ELSE json_extract(r.payload,'$.environment_kind') END)=?"
         );
         params.push(effectiveEnvId);
     }

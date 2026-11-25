@@ -16,15 +16,16 @@ import {
 import { HudInstance } from '../runtime/hud-instance.js';
 import { HUD_I18N } from '../runtime/hud-i18n.js';
 
-function createInPageHarness({ token = 'secret-csrf-token-value-123456', routes = {} }) {
+function createInPageHarness({ token = 'secret-csrf-token-value-123456', routes = {}, origin }) {
   const calls = [];
   const fakeWindow = {
+    location: { origin },
     localStorage: {
       getItem: (key) => (key === 'agy_session_csrf_token' ? token : null),
     },
     fetch: async (url, init) => {
       const method = String(url).split('/').pop();
-      calls.push({ url, method, headers: init?.headers, body: init?.body ? JSON.parse(init.body) : {} });
+      calls.push({ url, method, headers: init?.headers, redirect: init?.redirect, body: init?.body ? JSON.parse(init.body) : {} });
       const handler = routes[method];
       if (!handler) {
         return { ok: false, status: 404, async json() { return {}; } };
@@ -59,6 +60,23 @@ function createInPageHarness({ token = 'secret-csrf-token-value-123456', routes 
   };
   return { cdp, calls, token };
 }
+
+test('WSL RPC 仅在已核验的页面源发送请求，且拒绝 HTTP 重定向', async () => {
+  const origin = 'https://127.0.0.1:44001';
+  const { cdp, calls } = createInPageHarness({ origin, routes: {
+    GetUserStatus: { body: { userStatus: { email: 'wsl@example.invalid' } } },
+    RetrieveUserQuotaSummary: { body: {} },
+  } });
+  let verifiedOrigin;
+  const client = new SshRemoteRpcClient({ cdp, getContextId: () => 42, getVerifiedOrigin: () => verifiedOrigin });
+  assert.equal((await client.probeUserAndQuota()).reason, 'context_unavailable');
+  verifiedOrigin = 'https://127.0.0.1:44002';
+  assert.equal((await client.probeUserAndQuota()).reason, 'context_unavailable');
+  assert.deepEqual(calls, []);
+  verifiedOrigin = origin;
+  assert.equal((await client.probeUserAndQuota()).ok, true);
+  assert.deepEqual(calls.map(call => call.redirect), ['error', 'error']);
+});
 
 test('buildLiveProbeResultFromRpc 支持 local/remote_rpc 前缀与 Enterprise Vertex 识别', () => {
   const userStatus = {

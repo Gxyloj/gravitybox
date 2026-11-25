@@ -53,7 +53,9 @@ pub async fn get_app_info(backend: State<'_, Arc<BackendManager>>) -> Result<App
         let ag = get_antigravity_info(mgr.resource_dir());
         let os_label = format!("Windows {}", std::env::consts::ARCH);
         AppInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: option_env!("GRAVITYBOX_WINDOWS_RELEASE_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string(),
             state_dir: mgr.state_dir.to_string_lossy().to_string(),
             pipe_name: mgr.current_pipe_name(),
             os_label,

@@ -45,6 +45,15 @@ export function computeWinBuildNumber(version) {
   return major * 10000 + minor * 100 + patch;
 }
 
+/** Keep npm and Cargo on SemVer while supporting a Windows product revision. */
+export function resolveWindowsReleaseVersion({ version, windowsReleaseVersion = version }) {
+  const match = /^(\d+\.\d+\.\d+)(?:\.(\d+))?$/.exec(windowsReleaseVersion);
+  if (!match || match[1] !== version || windowsReleaseVersion.split('.').some(part => Number(part) > 65535)) {
+    throw new Error(`无效的 Windows 发布版本：${windowsReleaseVersion}`);
+  }
+  return windowsReleaseVersion;
+}
+
 export function resolveWindowsPackagePaths({
   projectRoot = root,
   version,
@@ -169,7 +178,7 @@ async function buildSelfContainedNsisInstaller({
     'UTF8',
     '/V3',
     `/DAPP_VERSION=${version}`,
-    `/DAPP_VI_VERSION=${version}.0`,
+    `/DAPP_VI_VERSION=${version.split('.').length === 4 ? version : `${version}.0`}`,
     `/DAPP_ARCH=${arch}`,
     `/DSTAGE_DIR=${appDir}`,
     `/DOUT_FILE=${asciiOutFile}`,
@@ -204,7 +213,8 @@ async function main() {
   const skipVerifyStamp = argv.includes('--skip-verify-stamp');
 
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-  const version = pkg.version;
+  const baseVersion = pkg.version;
+  const version = resolveWindowsReleaseVersion(pkg);
   const currentDigest = await sourceDigest(root);
   const currentWindowsDigest = await windowsSourceDigest(root);
   const { SUPPORTED_BUNDLES } = await import(pathToFileURL(join(root, 'dist', 'bundle.js')).href);
@@ -217,7 +227,7 @@ async function main() {
     verification = {
       digest: currentDigest,
       windowsDigest: currentWindowsDigest,
-      version,
+      version: baseVersion,
       at: new Date().toISOString(),
       artifacts: null,
     };
@@ -235,7 +245,7 @@ async function main() {
     if (
       verification.digest !== currentDigest ||
       verification.windowsDigest !== currentWindowsDigest ||
-      verification.version !== version
+      verification.version !== baseVersion
     ) {
       throw new Error('源码已变化或未通过检查，请先运行 npm run verify');
     }
@@ -274,6 +284,7 @@ async function main() {
       cwd: winAppDir,
       maxBuffer: 16e6,
       windowsHide: true,
+      env: { ...process.env, GRAVITYBOX_WINDOWS_RELEASE_VERSION: version },
     });
   }
   if (!existsSync(winDesktopBin)) {
@@ -310,7 +321,7 @@ async function main() {
     await mkdir(join(dest, '..'), { recursive: true });
     await copyFile(join(root, 'dist', ...name.split('/')), dest);
   }
-  await writeFile(join(resourcesDir, 'core', 'package.json'), JSON.stringify({ type: 'module', version }) + '\n', 'utf8');
+  await writeFile(join(resourcesDir, 'core', 'package.json'), JSON.stringify({ type: 'module', version: baseVersion }) + '\n', 'utf8');
 
   // 5. Dictionaries, model catalog, i18n, icons
   await cp(join(root, 'dict'), join(resourcesDir, 'core', 'dict'), {
@@ -330,7 +341,7 @@ async function main() {
   }
 
   // 6. Build metadata
-  const build = computeWinBuildNumber(version);
+  const build = computeWinBuildNumber(baseVersion);
   const [winHelperSha256, desktopBinarySha256, nodeSha256] = await Promise.all([
     fileSha256(join(resourcesDir, 'gravitybox-win-helper.exe')),
     fileSha256(join(appDir, 'GravityBox.exe')),

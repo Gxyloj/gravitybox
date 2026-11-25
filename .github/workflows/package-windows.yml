@@ -100,7 +100,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
-          $ver = [string]$pkg.version
+          $ver = if ($pkg.windowsReleaseVersion) { [string]$pkg.windowsReleaseVersion } else { [string]$pkg.version }
           $files = @(
             "成品/GravityBox-$ver-win-x64.zip",
             "成品/GravityBox-$ver-win-x64.zip.sha256"

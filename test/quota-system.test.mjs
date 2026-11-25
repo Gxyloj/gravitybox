@@ -16,6 +16,21 @@ const groups = (family, window, fraction, observed = stamp, reset = future) => n
 }]}, observed);
 const status = (models, gs = []) => buildArgonStatus(models, gs, familyWindowsFromGroups(gs, now), now);
 
+test('总览展示已连接 WSL 的实时配额，并保留配额来源', async () => {
+  const saved = { id: 'fixture', email: 'wsl@example.invalid', quota: { marker: 80 } };
+  const dashboard = await buildDashboardAggregate({
+    listAccounts: async () => ({ accounts: [saved], active_account: saved, active_account_id: saved.id }),
+    getAutoSwitchConfig: async () => ({ enabled: false }),
+    probeLiveLanguageServer: async () => ({ email: saved.email, quotaEnvironmentId: 'wsl', quota: { marker: 25 } }),
+    getAccount: async () => saved,
+    getAccountQuotaOverview: account => ({ fiveHourRemaining: account.quota.marker }),
+    getUsageSummary: async () => { throw new Error('isolated'); },
+    getPricingTable: async () => ({}),
+  });
+  assert.equal(dashboard.accounts.fiveHourRemaining, 25);
+  assert.equal(dashboard.accounts.quotaSourceEnvironmentId, 'wsl');
+});
+
 test('真实FREE响应：周窗口与模型自身额度独立，刷新、IPC和dashboard均保留模型真值', async t => {
   const fixture = JSON.parse(await readFile(new URL('./fixtures/free-model-quota.json', import.meta.url)));
   const clock = Date.parse(fixture.observedAt); t.mock.method(Date, 'now', () => clock);

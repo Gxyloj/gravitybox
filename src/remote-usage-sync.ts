@@ -75,7 +75,7 @@ export interface RemoteGenerationEvent {
   account_id?: string;
   account_email?: string;
   account_type?: RemoteAccountType;
-  environment_kind: 'ssh';
+  environment_kind: 'ssh' | 'wsl';
   environment_id: string;
   environment_label: string;
   trajectory_id: string;
@@ -86,6 +86,8 @@ export interface RemoteRpcTargetLike {
   remoteKey: string;
   hostLabel: string;
   environmentId?: string;
+  environmentKind?: 'wsl';
+  wslArchive?: WslUsageArchive;
   origin?: string;
   rpcClient: RemoteRpcClientLike;
   email?: string;
@@ -96,6 +98,11 @@ export interface RemoteRpcTargetLike {
   lastIdentityVerifiedAt?: number;
   reconnected?: boolean;
   windowCount?: number;
+}
+
+export interface WslUsageArchive {
+  listCascadeIds: () => Promise<string[]>;
+  lastAttemptedAt: Map<string, number>;
 }
 
 export interface RemoteIdentityObservedInfo {
@@ -180,6 +187,9 @@ const DEFAULT_MAX_TRAJECTORIES = 20;
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_BUDGET_MS = 12_000;
 const DEFAULT_PER_TARGET_BUDGET_MS = 4_000;
+const WSL_ARCHIVE_BATCH_SIZE = 32;
+const WSL_ARCHIVE_CONCURRENCY = 4;
+const WSL_ARCHIVE_RETRY_MS = 120_000;
 const DEFAULT_TARGET_CONCURRENCY = 2;
 const DEFAULT_IDENTITY_VERIFY_COOLDOWN_MS = 15_000;
 const MIN_VALID_UNIX_SECONDS = 946684800; // 2000-01-01T00:00:00Z
@@ -258,8 +268,8 @@ export function buildRemoteEnvironmentId(hostLabel: string): string {
 /**
  * 基于远端轨迹锚点生成稳定的远端 source_id（与 SSH 别名/端口/本地文件 inode 解耦）。
  */
-export function buildRemoteTrajectorySourceId(trajectoryAnchor: string): string {
-  return sha256Hex(JSON.stringify(['ssh', trajectoryAnchor]));
+export function buildRemoteTrajectorySourceId(trajectoryAnchor: string, wslEnvironmentId?: string): string {
+  return sha256Hex(JSON.stringify(wslEnvironmentId ? ['wsl', wslEnvironmentId, trajectoryAnchor] : ['ssh', trajectoryAnchor]));
 }
 
 /**
@@ -912,15 +922,56 @@ function shouldSyncTrajectory(
   return false;
 }
 
-/**
- * 对单个已连接的 SSH 远端页面会话执行纯同源 CDP RPC 增量用量采集（不依赖外部 ssh 二进制）。
- */
+async function addWslArchiveSummaries(
+  target: RemoteRpcTargetLike,
+  archive: WslUsageArchive,
+  summaries: RemoteTrajectorySummary[],
+  deadlineAt: number,
+  signal?: AbortSignal,
+): Promise<RemoteTrajectorySummary[]> {
+  const discover = target.rpcClient.getExecutorMetadata?.bind(target.rpcClient);
+  if (!discover || signal?.aborted) return summaries;
+  const ids = await archive.listCascadeIds().catch(() => undefined);
+  if (!ids || signal?.aborted || Date.now() >= deadlineAt) return summaries;
+
+  const byId = new Map(summaries.map(summary => [summary.cascadeId.toLowerCase(), summary]));
+  const onDisk = new Set(ids);
+  for (const id of archive.lastAttemptedAt.keys()) {
+    if (byId.has(id) || !onDisk.has(id)) archive.lastAttemptedAt.delete(id);
+  }
+  const now = Date.now();
+  const missing = ids.filter(id => !byId.has(id) && now - (archive.lastAttemptedAt.get(id) ?? 0) >= WSL_ARCHIVE_RETRY_MS)
+    .slice(0, WSL_ARCHIVE_BATCH_SIZE);
+
+  // This metadata-only call loads a saved trajectory into Antigravity's summary index.
+  let loaded = false;
+  for (let offset = 0; offset < missing.length && !signal?.aborted && Date.now() < deadlineAt; offset += WSL_ARCHIVE_CONCURRENCY) {
+    const batch = missing.slice(offset, offset + WSL_ARCHIVE_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(async id => {
+      archive.lastAttemptedAt.set(id, now);
+      return discover(id);
+    }));
+    loaded ||= results.some(result => result.status === 'fulfilled' && result.value.ok);
+  }
+  if (!loaded || signal?.aborted || Date.now() >= deadlineAt) return summaries;
+  const refreshed = await target.rpcClient.getAllCascadeTrajectories().catch(() => undefined);
+  if (!refreshed?.ok) return summaries;
+  for (const summary of refreshed.data) {
+    const id = summary.cascadeId.toLowerCase();
+    byId.set(id, summary);
+    archive.lastAttemptedAt.delete(id);
+  }
+  return [...byId.values()];
+}
+
+/** 对已连接的 SSH 或 WSL 会话执行同源 CDP RPC 增量用量采集。 */
 export async function syncRemoteSessionUsage(
   options: SyncRemoteSessionUsageOptions
 ): Promise<SyncRemoteSessionUsageResult> {
   const { target, receipts = {}, observationStore } = options;
   const hostLabel = cleanHostLabel(target.hostLabel) || 'ssh-host';
   const environmentId = target.environmentId || buildRemoteEnvironmentId(hostLabel);
+  const environmentKind = target.environmentKind ?? 'ssh';
   const nowMs = options.nowMs ?? Date.now();
   const nowSec = Math.floor(nowMs / 1000);
   const maxTrajectories = Math.max(1, Math.min(100, Math.floor(options.maxTrajectories ?? DEFAULT_MAX_TRAJECTORIES)));
@@ -952,9 +1003,9 @@ export async function syncRemoteSessionUsage(
     return emptyFailure(true, false, 'auth_expired');
   }
 
-  const raceWithRemainingBudget = async <T>(work: Promise<T>): Promise<{ timedOut: true } | { timedOut: false; value: T }> => {
+  const raceWithRemainingBudget = async <T>(work: Promise<T>, capMs = Infinity): Promise<{ timedOut: true } | { timedOut: false; value: T }> => {
     if (options.signal?.aborted) return { timedOut: true };
-    const remainingMs = deadlineAt - Date.now();
+    const remainingMs = Math.min(capMs, deadlineAt - Date.now());
     if (remainingMs <= 0) return { timedOut: true };
     let timer: NodeJS.Timeout | undefined;
     let onAbort: (() => void) | undefined;
@@ -1042,7 +1093,16 @@ export async function syncRemoteSessionUsage(
     });
   }
 
-  const summaries = Array.isArray(trajectoriesRes.data) ? trajectoriesRes.data : [];
+  let summaries = Array.isArray(trajectoriesRes.data) ? trajectoriesRes.data : [];
+  if (environmentKind === 'wsl' && target.wslArchive) {
+    const archiveBudgetMs = Math.min(3500, Math.floor((deadlineAt - Date.now()) / 2));
+    if (archiveBudgetMs > 0) {
+      const archive = await raceWithRemainingBudget(addWslArchiveSummaries(
+        target, target.wslArchive, summaries, Date.now() + archiveBudgetMs, options.signal,
+      ).catch(() => summaries), archiveBudgetMs);
+      if (!archive.timedOut) summaries = archive.value;
+    }
+  }
   const summarySiblingModelIds = new Set<string>();
   const cascadeIdByTrajectoryId = new Map<string, string>();
   const summaryByCascadeIdLower = new Map<string, RemoteTrajectorySummary>();
@@ -1066,7 +1126,7 @@ export async function syncRemoteSessionUsage(
     .map(summary => {
       const trajectoryId = typeof summary.trajectoryId === 'string' ? summary.trajectoryId.trim() : '';
       const trajectoryAnchor = trajectoryId || `${environmentId}:${summary.cascadeId}`;
-      const remoteSourceId = buildRemoteTrajectorySourceId(trajectoryAnchor);
+      const remoteSourceId = buildRemoteTrajectorySourceId(trajectoryAnchor, environmentKind === 'wsl' ? environmentId : undefined);
       const prevReceipt = receipts[remoteSourceId];
       const lastModifiedSec = parseConnectTimestampSeconds(summary.lastModifiedTime) ?? 0;
       const stepCount = normalizeNonNegativeInt(summary.stepCount);
@@ -1330,7 +1390,7 @@ export async function syncRemoteSessionUsage(
         ...(attribution.account_id ? { account_id: attribution.account_id } : {}),
         ...(attribution.account_email ? { account_email: attribution.account_email } : {}),
         ...(attribution.account_type ? { account_type: attribution.account_type } : {}),
-        environment_kind: 'ssh',
+        environment_kind: environmentKind,
         environment_id: environmentId,
         environment_label: hostLabel,
         trajectory_id: trajectoryId || summary.cascadeId,
@@ -1586,7 +1646,7 @@ export class RemoteUsageSyncCoordinator {
   }
 
   markEnvironmentDisconnected(hostLabelOrEnvId: string, disconnectedAtSec?: number): void {
-    const envId = hostLabelOrEnvId.startsWith('ssh:')
+    const envId = /^(?:ssh|wsl):/.test(hostLabelOrEnvId)
       ? hostLabelOrEnvId
       : buildRemoteEnvironmentId(hostLabelOrEnvId);
     this.observationStore.markDisconnected(envId, disconnectedAtSec);
@@ -1701,9 +1761,9 @@ export class RemoteUsageSyncCoordinator {
               this.onIdentityObserved?.(info);
             },
             nowMs: options?.nowMs,
-            maxTrajectories: this.maxTrajectoriesPerTarget,
+            maxTrajectories: rawTarget.wslArchive ? Math.max(WSL_ARCHIVE_BATCH_SIZE, this.maxTrajectoriesPerTarget) : this.maxTrajectoriesPerTarget,
             concurrency: this.concurrencyPerTarget,
-            budgetMs: this.perTargetBudgetMs,
+            budgetMs: rawTarget.wslArchive ? Math.max(10_000, this.perTargetBudgetMs) : this.perTargetBudgetMs,
             force: options?.force,
             signal: options?.signal,
           });
